@@ -1,0 +1,231 @@
+---
+# ─── Namespace ────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: anton-storage
+
+---
+# ─── Secrets ──────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: anton-secrets
+  namespace: anton-storage
+type: Opaque
+stringData:
+  jwt-secret: "replace-with-256-bit-secret-in-prod"
+  db-password: "anton_secret"
+
+---
+# ─── ConfigMap ────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: anton-config
+  namespace: anton-storage
+data:
+  SPRING_DATA_REDIS_HOST: redis-service
+  STORAGE_ROOT: /app/storage-data
+  CORS_ORIGINS: "https://your-domain.com"
+
+---
+# ─── PostgreSQL ───────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: anton-storage
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - { name: POSTGRES_DB, value: antondb }
+            - { name: POSTGRES_USER, value: anton }
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: anton-secrets, key: db-password }
+          ports: [{ containerPort: 5432 }]
+          volumeMounts:
+            - name: pg-data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: pg-data
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+  namespace: anton-storage
+spec:
+  selector: { app: postgres }
+  ports: [{ port: 5432 }]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: anton-storage
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+# ─── Redis ────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: anton-storage
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: redis }
+  template:
+    metadata:
+      labels: { app: redis }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports: [{ containerPort: 6379 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+  namespace: anton-storage
+spec:
+  selector: { app: redis }
+  ports: [{ port: 6379 }]
+
+---
+# ─── API Deployment ───────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anton-api
+  namespace: anton-storage
+spec:
+  replicas: 2                # Horizontal scaling
+  selector:
+    matchLabels: { app: anton-api }
+  template:
+    metadata:
+      labels: { app: anton-api }
+    spec:
+      containers:
+        - name: api
+          image: your-registry/anton-storage-api:latest
+          ports: [{ containerPort: 8080 }]
+          envFrom:
+            - configMapRef: { name: anton-config }
+          env:
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef: { name: anton-secrets, key: jwt-secret }
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://postgres-service:5432/antondb
+            - name: SPRING_DATASOURCE_USERNAME
+              value: anton
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: anton-secrets, key: db-password }
+          volumeMounts:
+            - name: storage-vol
+              mountPath: /app/storage-data
+          resources:
+            requests: { memory: "512Mi", cpu: "250m" }
+            limits:   { memory: "1Gi",   cpu: "1000m" }
+          livenessProbe:
+            httpGet: { path: /actuator/health, port: 8080 }
+            initialDelaySeconds: 30
+          readinessProbe:
+            httpGet: { path: /actuator/health, port: 8080 }
+            initialDelaySeconds: 10
+      volumes:
+        - name: storage-vol
+          persistentVolumeClaim:
+            claimName: storage-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: anton-api-service
+  namespace: anton-storage
+spec:
+  selector: { app: anton-api }
+  ports: [{ port: 8080 }]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: storage-pvc
+  namespace: anton-storage
+spec:
+  accessModes: [ReadWriteMany]   # RWX for multi-replica; use EFS/NFS or object store in prod
+  resources:
+    requests:
+      storage: 100Gi
+
+---
+# ─── HPA (auto-scaling) ───────────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: anton-api-hpa
+  namespace: anton-storage
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: anton-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+---
+# ─── Ingress ──────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: anton-ingress
+  namespace: anton-storage
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "512m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: storage.your-domain.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: anton-api-service
+                port: { number: 8080 }
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-service
+                port: { number: 80 }
