@@ -1,4 +1,4 @@
-# 🗄️ Anton Distributed Storage Platform
+# Anton Distributed Storage Platform
 
 A production-grade distributed object storage platform inspired by Amazon S3 and Google Drive — built with Spring Boot, PostgreSQL, Redis, and React.
 
